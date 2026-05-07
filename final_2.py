@@ -801,26 +801,68 @@ class UnderstandingAgent:
                 return value
 
         if "date_time" in target_field:
-            date_keywords = ["yesterday", "today", "tomorrow"]
-            for kw in date_keywords:
-                if kw in text_words:
-                    return kw
+            # Extract date AND time
+            date_keywords = ["yesterday", "today", "tomorrow", "tonight", "last night"]
+            time_keywords = ["morning", "afternoon", "evening", "night", "noon", "midnight"]
+
+            # Check for explicit date + time combinations
+            for date_kw in date_keywords:
+                if date_kw in text_lower:
+                    for time_kw in time_keywords:
+                        if time_kw in text_lower:
+                            return f"{date_kw} {time_kw}"
+                    return date_kw
+
+            # Check for time alone
+            for time_kw in time_keywords:
+                if time_kw in text_lower:
+                    return time_kw
 
         elif "date" in target_field:
-            date_keywords = ["yesterday", "today", "tomorrow", "monday", "tuesday", "wednesday",
-                            "thursday", "friday", "saturday", "sunday"]
+            date_keywords = [
+                "yesterday", "today", "tomorrow",
+                "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+                "last week", "this week", "next week",
+                "last month", "this month", "next month",
+                "last year", "this year", "next year",
+                "tonight", "last night"
+            ]
+
             for kw in date_keywords:
-                if kw in text_words:
+                if kw in text_lower:
+                    return kw
+
+        elif "time" in target_field:
+            time_keywords = [
+                "morning", "afternoon", "evening", "night", "noon", "midnight",
+                "early", "late", "dawn", "dusk", "sunset", "sunrise"
+            ]
+
+            for kw in time_keywords:
+                if kw in text_lower:
                     return kw
 
         elif "location" in target_field or "place" in target_field or "address" in target_field:
-            location_keywords = ["house", "home", "office", "street", "park", "restaurant",
-                               "store", "bank", "hospital", "station", "apartment", "building"]
+            location_keywords = [
+                "house", "home", "office", "street", "park", "restaurant",
+                "store", "bank", "hospital", "station", "apartment", "building",
+                "school", "college", "university", "mall", "market", "shop",
+                "clinic", "pharmacy", "hotel", "cafe", "gym", "library",
+                "church", "temple", "mosque", "beach", "mountain", "lake",
+                "road", "avenue", "lane", "plaza", "square", "compound"
+            ]
+
+            # Try substring matching first (more reliable)
             for kw in location_keywords:
-                if kw in text_words:
-                    idx = text_words.index(kw)
-                    context = text_words[max(0, idx-2):min(len(text_words), idx+3)]
-                    return " ".join(context)
+                if kw in text_lower:
+                    # Find the word in the text and extract with context
+                    kw_idx = text_lower.find(kw)
+                    if kw_idx != -1:
+                        # Get context around the keyword
+                        start = max(0, kw_idx - 30)
+                        end = min(len(text), kw_idx + len(kw) + 30)
+                        context = text[start:end].strip()
+                        return context
 
         return None
 
@@ -911,6 +953,23 @@ class UnderstandingAgent:
         # LLM FIELD EXTRACTION
         # =================================================
 
+        # Special instructions for date/time fields
+        date_time_instructions = ""
+        if "date" in target_field.lower() or "time" in target_field.lower():
+            date_time_instructions = """
+SPECIAL INSTRUCTIONS FOR DATE/TIME:
+- Extract relative dates: yesterday, today, tomorrow, last week, next month, etc.
+- Extract days: monday, tuesday, wednesday, thursday, friday, saturday, sunday
+- Extract times: morning, afternoon, evening, night, noon, midnight, dawn, dusk
+- Preserve exact phrasing (e.g., "last night", "this afternoon", "next week")
+- Examples:
+  * "it happened yesterday" → "yesterday"
+  * "yesterday evening" → "yesterday evening"
+  * "last week friday" → "last week friday"
+  * "this morning at 9am" → "this morning"
+- Do NOT try to convert to dates, just preserve the natural language
+"""
+
         prompt = f"""
 You are extracting a structured field value.
 
@@ -930,6 +989,7 @@ Rules:
 - Do NOT invent values
 - Preserve natural language time expressions
 - If unclear return empty JSON
+{date_time_instructions}
 
 Format:
 {{"{target_field}": "value"}}
