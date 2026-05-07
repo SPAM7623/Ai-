@@ -395,6 +395,28 @@ class CaseState:
         return False, None
 
     # =====================================================
+    # LOW CONFIDENCE FIELD DETECTION
+    # =====================================================
+
+    def get_low_confidence_fields(self, threshold=0.80):
+        """
+        After soft reset, identify preserved entities with low confidence
+        Returns list of (field_name, confidence, value) tuples
+        """
+        low_conf_fields = []
+
+        for field_name, value in self.entities.items():
+            if not value:
+                continue
+
+            confidence = self.entity_confidence.get(field_name, 0.0)
+
+            if confidence < threshold:
+                low_conf_fields.append((field_name, confidence, value))
+
+        return low_conf_fields
+
+    # =====================================================
     # FULL RESET
     # =====================================================
 
@@ -2098,6 +2120,43 @@ Ask the user to provide:
         }
 
     # =====================================================
+    # RE-VERIFY LOW CONFIDENCE FIELDS (after soft reset)
+    # =====================================================
+
+    def ask_reverify_low_confidence(self, state):
+
+        low_conf_fields = state.get_low_confidence_fields(threshold=0.80)
+
+        if not low_conf_fields:
+            return None
+
+        state.last_action = "reverify_low_confidence"
+
+        field_name, confidence, value = low_conf_fields[0]
+
+        state.current_field = field_name
+        state.last_asked_field = field_name
+
+        nice_field = self.humanize(field_name)
+
+        instruction = f"""
+Before we continue, I want to double-check a detail.
+
+You mentioned {nice_field} as: {value}
+
+Is that correct?
+"""
+
+        return {
+            "text": self.gen(
+                state,
+                instruction
+            ),
+            "action": "reverify_field",
+            "field": field_name
+        }
+
+    # =====================================================
     # ASK CORRECTION OR RESTART
     # CASE A
     # =====================================================
@@ -3364,6 +3423,20 @@ class Pipeline:
             )
 
             # ---------------------------------------------
+            # RE-VERIFY LOW CONFIDENCE FIELDS (after soft reset)
+            # ---------------------------------------------
+
+            if state.just_reset:
+
+                reverify_response = self.i.ask_reverify_low_confidence(state)
+
+                if reverify_response:
+                    return (state, reverify_response)
+
+                # No low-confidence fields to reverify
+                state.just_reset = False
+
+            # ---------------------------------------------
             # ASK MISSING FIELDS
             # ---------------------------------------------
 
@@ -3383,6 +3456,62 @@ class Pipeline:
                 self.build_verification_response(
                     state
                 )
+            )
+
+        # =================================================
+        # REVERIFY RESPONSE (after soft reset)
+        # =================================================
+
+        if state.last_action == "reverify_low_confidence":
+
+            target_field = state.current_field
+
+            if self.d.is_pure_yes(self.d.normalize(text)):
+
+                # User confirmed the value, increase confidence
+                state.entity_confidence[target_field] = 0.95
+                state.last_action = None
+
+            elif self.d.detect_explicit_correction(text):
+
+                # User is correcting the value
+                extracted = self.u.extract(
+                    text,
+                    mode="field",
+                    target_field=target_field,
+                    state=state
+                )
+
+                if extracted:
+                    state = self.c.update_case(
+                        state,
+                        extracted,
+                        mode="correction"
+                    )
+
+                    state.entity_confidence[target_field] = 0.95
+                    state.last_action = None
+
+            # Check for more low-confidence fields
+            reverify_response = self.i.ask_reverify_low_confidence(state)
+
+            if reverify_response:
+                return (state, reverify_response)
+
+            # No more low-confidence fields found
+            state.just_reset = False
+
+            # Continue with missing fields
+            if state.missing_fields:
+                return (
+                    state,
+                    self.i.ask_missing(state)
+                )
+
+            # All fields done, go to verification
+            return (
+                state,
+                self.build_verification_response(state)
             )
 
         # =================================================
