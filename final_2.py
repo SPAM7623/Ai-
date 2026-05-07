@@ -1000,7 +1000,7 @@ OR
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -1079,7 +1079,7 @@ OR
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -1139,7 +1139,7 @@ Input:
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -1593,7 +1593,7 @@ Return ONLY JSON.
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -1659,7 +1659,7 @@ OR
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -2082,7 +2082,7 @@ Instruction:
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -2630,7 +2630,7 @@ Return text only.
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -3255,7 +3255,7 @@ Format:
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
