@@ -83,7 +83,7 @@ class CaseState:
     # retry tracking
     field_attempts: Dict[str, int] = field(default_factory=dict)
 
-    max_field_attempts: int = 2
+    max_field_attempts: int = 3
 
     # =====================================================
     # MASTER FLOW STATE
@@ -574,24 +574,33 @@ class UnderstandingAgent:
         text_lower = str(text or "").lower()
 
         explicit_frustration = [
-            "frustrat", "annoyed", "annoying", "tired of",
+            "frustrat", "annoyed", "annoying", "annoyed", "tired of",
             "fed up", "enough", "stop", "quit", "give up",
-            "waste time", "waste my time", "pointless"
+            "waste time", "waste my time", "pointless",
+            "ridiculous", "ridiculos", "absurd", "unacceptable",
+            "angry", "furious", "enraged", "mad",
+            "upset", "unhappy", "dissatisfied",
+            "irritated", "irritating",
+            "exhausted", "exhausting",
+            "sick of", "sick and tired"
         ]
 
         confusion_phrases = [
-            "i can't understand", "i don't understand", "don't understand",
+            "can't understand", "cannot understand", "don't understand",
+            "cannot understand",
+            "can't figure", "can't make sense",
             "confusing", "confused", "confuse me",
-            "unclear", "not clear", "what does",
-            "what do you mean", "what are you asking",
+            "unclear", "not clear", "vague",
+            "what does", "what do you mean", "what are you asking",
             "too complicated", "too complex", "too many",
-            "complicated", "complex"
+            "complicated", "complex", "bewildering"
         ]
 
         incompleteness = [
-            "i don't know", "i don't know what",
-            "i don't know how", "i can't", "unable to",
-            "i can't provide", "i can't help"
+            "don't know", "don't know what", "don't know how",
+            "can't", "cannot", "unable to",
+            "can't provide", "can't help",
+            "not sure", "unsure", "no idea"
         ]
 
         def find_phrase(phrases):
@@ -601,12 +610,15 @@ class UnderstandingAgent:
         confusion_count = sum(1 for phrase in confusion_phrases if find_phrase([phrase]))
         incompleteness_count = sum(1 for phrase in incompleteness if find_phrase([phrase]))
 
+        # Explicit frustration triggers high immediately
         if frustration_count >= 1:
             return "high"
 
+        # Multiple confusion signals trigger high
         if confusion_count >= 2 or incompleteness_count >= 2:
-            return "medium_high"
+            return "high"
 
+        # Single confusion signal = medium_high
         if confusion_count >= 1 or incompleteness_count >= 1:
             return "medium_high"
 
@@ -773,6 +785,21 @@ class UnderstandingAgent:
         text_lower = text.lower().strip()
         text_words = text_lower.split()
 
+        # =====================================================
+        # SIMPLE "IT'S [VALUE]" OR "ITS [VALUE]" PATTERN
+        # =====================================================
+        # Handle simple statements like "it's house" or "its house"
+        if text_lower.startswith("it's ") or text_lower.startswith("its "):
+            # Extract everything after "it's" or "its"
+            if text_lower.startswith("it's "):
+                value = text[5:].strip()  # Skip "it's "
+            else:
+                value = text[4:].strip()  # Skip "its "
+
+            # Only return if it's reasonably short (not a full sentence)
+            if value and len(value.split()) <= 3:
+                return value
+
         if "date_time" in target_field:
             date_keywords = ["yesterday", "today", "tomorrow"]
             for kw in date_keywords:
@@ -786,9 +813,9 @@ class UnderstandingAgent:
                 if kw in text_words:
                     return kw
 
-        elif "location" in target_field or "place" in target_field:
+        elif "location" in target_field or "place" in target_field or "address" in target_field:
             location_keywords = ["house", "home", "office", "street", "park", "restaurant",
-                               "store", "bank", "hospital", "station"]
+                               "store", "bank", "hospital", "station", "apartment", "building"]
             for kw in location_keywords:
                 if kw in text_words:
                     idx = text_words.index(kw)
@@ -3277,6 +3304,19 @@ class Pipeline:
                 "reason": "user_requested_human"
             }
 
+        # =====================================================
+        # DIRECT ATTEMPTS THRESHOLD CHECK
+        # =====================================================
+        # If attempts exceed max, escalate immediately
+        # Don't wait for sentiment or escalation score
+
+        if state.attempts > state.max_attempts:
+            state.sentiment = "high"
+            return {
+                "action": "handover",
+                "reason": "max_attempts_exceeded"
+            }
+
         if self.u.detect_repetition_fatigue(state):
             state.sentiment = "high"
 
@@ -3443,10 +3483,9 @@ class Pipeline:
 
             if action == "reset":
 
-                state.soft_reset()
-
                 state.awaiting_new_issue = True
 
+                # NOTE: ask_rephrase() calls soft_reset() internally
                 return (
                     state,
                     self.i.ask_rephrase(state)
@@ -3736,6 +3775,10 @@ class Pipeline:
                 extracted,
                 mode="normal"
             )
+
+            # Explicitly increase confidence on successful fill
+            # (should already happen in update_case, but ensuring here)
+            state.increase_confidence(0.02)
 
             # ---------------------------------------------
             # MORE FIELDS REMAIN
