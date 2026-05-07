@@ -137,6 +137,12 @@ class CaseState:
     correction_count: int = 0
     last_corrected_field: Optional[str] = None
 
+    field_correction_count: Dict[str, int] = field(default_factory=dict)
+    correction_passes: int = 0
+    fields_corrected_in_pass: List[str] = field(default_factory=list)
+    max_field_corrections: int = 3
+    department_field_count: int = 0
+
     # =====================================================
     # GLOBAL FLOW CONTROL
     # =====================================================
@@ -182,6 +188,8 @@ class CaseState:
             raise ValueError("max_field_attempts must be greater than 0")
         if self.max_correction_count <= 0:
             raise ValueError("max_correction_count must be greater than 0")
+        if self.max_field_corrections <= 0:
+            raise ValueError("max_field_corrections must be greater than 0")
 
     # =====================================================
     # SAFE ENTITY UPDATE
@@ -299,6 +307,11 @@ class CaseState:
         """
         reset conversational flow
         preserve entities + language
+        ✓ KEEPS: All extracted data, sentiment, confidence, language
+        ✗ CLEARS: attempts, corrections, field attempts, current field
+
+        Used for: Correction loops, high escalation score
+        Effect: User restarts but system remembers what they said before
         """
 
         self.attempts = 0
@@ -314,6 +327,72 @@ class CaseState:
         self.just_reset = True
 
         self.stage = "collection"
+
+        self.field_attempts = {}
+        self.correction_passes = 0
+        self.fields_corrected_in_pass = []
+
+    # =====================================================
+    # CORRECTION TRACKING
+    # =====================================================
+
+    def track_field_correction(self, field_name):
+        """Track corrections per field and detect drift/repetition"""
+        self.field_correction_count[field_name] = (
+            self.field_correction_count.get(field_name, 0) + 1
+        )
+
+        if field_name not in self.fields_corrected_in_pass:
+            self.fields_corrected_in_pass.append(field_name)
+
+        return self.field_correction_count[field_name]
+
+    def detect_correction_drift(self):
+        """
+        Detect if user is correcting same field too many times
+        Returns: (is_drifting, reason)
+        """
+        if not self.field_correction_count:
+            return False, None
+
+        for field_name, count in self.field_correction_count.items():
+            if count > self.max_field_corrections:
+                return True, f"Field '{field_name}' corrected {count} times"
+
+        return False, None
+
+    def detect_multi_pass_drift(self):
+        """
+        Detect if user has gone through ALL fields and is correcting again
+        Indicates uncertainty or confusion about the data
+        """
+        if not self.department_field_count or not self.fields_corrected_in_pass:
+            return False, None
+
+        unique_fields_corrected = len(self.fields_corrected_in_pass)
+
+        if unique_fields_corrected >= self.department_field_count:
+            self.correction_passes += 1
+
+            if self.correction_passes >= 2:
+                return True, f"User correcting fields for 2nd time (uncertainty)"
+
+            self.fields_corrected_in_pass = []
+
+        return False, None
+
+    def check_total_corrections_exceed_fields(self):
+        """
+        If total corrections > number of fields in department,
+        user is likely confused or uncertain
+        """
+        if not self.department_field_count:
+            return False, None
+
+        if self.correction_count > self.department_field_count:
+            return True, f"Total corrections ({self.correction_count}) exceed fields ({self.department_field_count})"
+
+        return False, None
 
     # =====================================================
     # FULL RESET
@@ -1670,6 +1749,9 @@ OR
                         state.register_correction(
                             field
                         )
+                        state.track_field_correction(
+                            field
+                        )
 
             state.reduce_confidence(0.05)
 
@@ -1716,6 +1798,9 @@ OR
                 state.department = (
                     department["name"]
                 )
+                state.department_field_count = len(
+                    department.get("required_fields", [])
+                )
 
         else:
 
@@ -1724,6 +1809,10 @@ OR
                     state.department
                 )
             )
+            if department:
+                state.department_field_count = len(
+                    department.get("required_fields", [])
+                )
 
         # -------------------------------------------------
         # NO DEPARTMENT FOUND
@@ -3073,6 +3162,24 @@ class Pipeline:
 
         if self.u.detect_repetition_fatigue(state):
             state.sentiment = "high"
+
+        is_field_drift, drift_reason = state.detect_correction_drift()
+        if is_field_drift:
+            state.sentiment = "high"
+            if DEBUG:
+                logger.debug(f"Correction drift detected: {drift_reason}")
+
+        is_multi_pass, multi_pass_reason = state.detect_multi_pass_drift()
+        if is_multi_pass:
+            state.sentiment = "high"
+            if DEBUG:
+                logger.debug(f"Multi-pass drift detected: {multi_pass_reason}")
+
+        exceeds_fields, exceed_reason = state.check_total_corrections_exceed_fields()
+        if exceeds_fields:
+            state.sentiment = "high"
+            if DEBUG:
+                logger.debug(f"Corrections exceed fields: {exceed_reason}")
 
         escalation_score = self._calculate_escalation_score(state)
 
