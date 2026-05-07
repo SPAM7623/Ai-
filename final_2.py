@@ -150,6 +150,7 @@ class CaseState:
 
     attempts: int = 0
     max_attempts: int = 3
+    max_correction_count: int = 4
 
     # =====================================================
     # VERIFICATION / COMPLETION
@@ -179,6 +180,8 @@ class CaseState:
             raise ValueError("max_attempts must be greater than 0")
         if self.max_field_attempts <= 0:
             raise ValueError("max_field_attempts must be greater than 0")
+        if self.max_correction_count <= 0:
+            raise ValueError("max_correction_count must be greater than 0")
 
     # =====================================================
     # SAFE ENTITY UPDATE
@@ -259,17 +262,15 @@ class CaseState:
 
     def reduce_confidence(self, amount=0.1):
         """Reduce confidence - penalizes failed extraction"""
-        penalty = amount + (self.attempts * 0.05)
-        self.confidence = max(0.0, self.confidence - penalty)
+        self.confidence = max(0.0, self.confidence - amount)
 
     def increase_confidence(self, amount=0.05):
         """Increase confidence - rewards successful extraction"""
-        bonus = amount + (0.05 if self.attempts == 0 else 0)
-        self.confidence = min(1.0, self.confidence + bonus)
+        self.confidence = min(1.0, self.confidence + amount)
 
     def apply_attempt_decay(self):
-        """Apply decay to confidence based on total attempts"""
-        decay_factor = 1.0 - (self.attempts * 0.08)
+        """Apply decay to confidence based on total attempts (call only on failure)"""
+        decay_factor = max(0.6, 1.0 - (self.attempts * 0.08))
         self.confidence = max(0.0, self.confidence * decay_factor)
 
     # =====================================================
@@ -419,28 +420,38 @@ class UnderstandingAgent:
         """Detect abuse/danger keywords and escalate sentiment"""
         text_lower = str(text or "").lower()
 
-        abuse_keywords = [
-            "abuse", "hit", "beat", "punch", "kick", "slap",
+        negation_words = ["not", "no", "don't", "didn't", "isn't", "aren't", "wasn't", "weren't"]
+        has_negation = any(f" {word} " in f" {text_lower} " for word in negation_words)
+
+        critical_keywords = ["abuse", "assault", "violence", "weapon", "gun", "knife"]
+        danger_keywords = [
             "threat", "threatened", "threatening", "threaten",
-            "assault", "attack", "violence", "violent",
-            "tough", "aggressive", "dangerous", "danger",
+            "attack", "violent",
             "scared", "afraid", "fear", "terrified",
-            "hurt", "harm", "injury", "injure",
-            "weapon", "gun", "knife",
-            "police", "call police", "help"
+            "hurt", "harm", "injury", "injure"
+        ]
+        concern_keywords = [
+            "hit", "beat", "punch", "kick", "slap",
+            "aggressive", "dangerous", "danger"
         ]
 
-        detected_keywords = [
-            kw for kw in abuse_keywords
-            if kw in text_lower
-        ]
+        def word_in_text(word):
+            return re.search(r'\b' + re.escape(word) + r'\b', text_lower)
 
-        if len(detected_keywords) >= 2 or any(
-            kw in text_lower for kw in ["abuse", "assault", "violence", "threat"]
-        ):
+        critical_count = sum(1 for kw in critical_keywords if word_in_text(kw))
+        danger_count = sum(1 for kw in danger_keywords if word_in_text(kw))
+        concern_count = sum(1 for kw in concern_keywords if word_in_text(kw))
+
+        if has_negation and (danger_count > 0 or concern_count >= 2):
+            return None
+
+        if critical_count >= 1 or danger_count >= 2:
             return "high"
 
-        if detected_keywords:
+        if danger_count >= 1 or concern_count >= 2:
+            return "medium_high"
+
+        if concern_count >= 1:
             return "medium_high"
 
         return None
@@ -590,21 +601,31 @@ class UnderstandingAgent:
     # =====================================================
 
     def _extract_context_keywords(self, text, target_field):
-        """Extract values using field-specific keyword patterns"""
+        """Extract values using field-specific keyword patterns with word boundaries"""
         text_lower = text.lower().strip()
+        text_words = text_lower.split()
 
-        date_keywords = ["yesterday", "today", "tomorrow", "last", "next", "on", "at", "when"]
-        location_keywords = ["at", "in", "near", "located", "place", "house", "street", "area"]
-
-        if "date" in target_field or "time" in target_field:
+        if "date_time" in target_field:
+            date_keywords = ["yesterday", "today", "tomorrow"]
             for kw in date_keywords:
-                if kw in text_lower:
-                    return text.strip()
+                if kw in text_words:
+                    return kw
 
-        if "location" in target_field or "place" in target_field:
+        elif "date" in target_field:
+            date_keywords = ["yesterday", "today", "tomorrow", "monday", "tuesday", "wednesday",
+                            "thursday", "friday", "saturday", "sunday"]
+            for kw in date_keywords:
+                if kw in text_words:
+                    return kw
+
+        elif "location" in target_field or "place" in target_field:
+            location_keywords = ["house", "home", "office", "street", "park", "restaurant",
+                               "store", "bank", "hospital", "station"]
             for kw in location_keywords:
-                if kw in text_lower:
-                    return text.strip()
+                if kw in text_words:
+                    idx = text_words.index(kw)
+                    context = text_words[max(0, idx-2):min(len(text_words), idx+3)]
+                    return " ".join(context)
 
         return None
 
@@ -1547,15 +1568,17 @@ OR
                 {}
             ).items():
 
-                state.update_entity(
-                    field_name=field,
-                    value=value,
-                    confidence=extracted.get(
-                        "confidence",
-                        0.8
-                    ),
-                    source="global_extraction"
-                )
+                formatted_value = self.format_extracted_value(value, field)
+                if formatted_value:
+                    state.update_entity(
+                        field_name=field,
+                        value=formatted_value,
+                        confidence=extracted.get(
+                            "confidence",
+                            0.8
+                        ),
+                        source="global_extraction"
+                    )
 
         # =================================================
         # CORRECTION UPDATE
@@ -1568,17 +1591,19 @@ OR
                 if field.startswith("__"):
                     continue
 
-                updated = state.update_entity(
-                    field_name=field,
-                    value=value,
-                    confidence=0.95,
-                    source="correction"
-                )
-
-                if updated:
-                    state.register_correction(
-                        field
+                formatted_value = self.format_extracted_value(value, field)
+                if formatted_value:
+                    updated = state.update_entity(
+                        field_name=field,
+                        value=formatted_value,
+                        confidence=0.95,
+                        source="correction"
                     )
+
+                    if updated:
+                        state.register_correction(
+                            field
+                        )
 
             state.reduce_confidence(0.05)
 
@@ -1593,12 +1618,14 @@ OR
                 if field.startswith("__"):
                     continue
 
-                state.update_entity(
-                    field_name=field,
-                    value=value,
-                    confidence=0.9,
-                    source="normal_update"
-                )
+                formatted_value = self.format_extracted_value(value, field)
+                if formatted_value:
+                    state.update_entity(
+                        field_name=field,
+                        value=formatted_value,
+                        confidence=0.9,
+                        source="normal_update"
+                    )
 
             state.increase_confidence(0.05)
 
@@ -2963,7 +2990,8 @@ class Pipeline:
     def apply_control(
         self,
         state,
-        text
+        text,
+        is_failed_attempt=False
     ):
 
         t = str(text or "").lower().strip()
@@ -2978,7 +3006,8 @@ class Pipeline:
                 "reason": "user_requested_human"
             }
 
-        state.apply_attempt_decay()
+        if is_failed_attempt:
+            state.apply_attempt_decay()
 
         escalation_score = self._calculate_escalation_score(state)
 
@@ -3009,10 +3038,16 @@ class Pipeline:
     def _calculate_escalation_score(self, state):
         """Weighted scoring: (attempts*0.4) + (corrections*0.3) + (sentiment*0.3)"""
         attempt_score = min(1.0, state.attempts / state.max_attempts)
-        correction_score = min(1.0, state.correction_count / 4.0)
-        sentiment_score = 0.7 if state.sentiment == "high" else (
-            0.4 if state.sentiment == "medium_high" else 0.1
-        )
+        correction_score = min(1.0, state.correction_count / float(state.max_correction_count))
+
+        if state.sentiment == "high":
+            sentiment_score = 0.7
+        elif state.sentiment == "medium_high":
+            sentiment_score = 0.4
+        elif state.sentiment is not None:
+            sentiment_score = 0.1
+        else:
+            sentiment_score = 0.05
 
         total_score = (
             attempt_score * 0.4 +
