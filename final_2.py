@@ -7,8 +7,17 @@ Original file is located at
     https://colab.research.google.com/drive/19nlVdnJHKvC3honcc3nrAYALGMELJrIi
 """
 
+import json
+import re
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+from openai import OpenAI
+
+DEBUG = True
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,7 +45,7 @@ class CaseState:
     # =====================================================
 
     sentiment: Optional[str] = None
-    confidence: float = 0.0
+    confidence: float = 0.85
     language: Optional[str] = None
 
     # =====================================================
@@ -74,7 +83,7 @@ class CaseState:
     # retry tracking
     field_attempts: Dict[str, int] = field(default_factory=dict)
 
-    max_field_attempts: int = 2
+    max_field_attempts: int = 3
 
     # =====================================================
     # MASTER FLOW STATE
@@ -128,6 +137,20 @@ class CaseState:
     correction_count: int = 0
     last_corrected_field: Optional[str] = None
 
+    field_correction_count: Dict[str, int] = field(default_factory=dict)
+    correction_passes: int = 0
+    fields_corrected_in_pass: List[str] = field(default_factory=list)
+    max_field_corrections: int = 3
+    department_field_count: int = 0
+
+    # =====================================================
+    # REVERIFICATION STATE (after soft reset)
+    # =====================================================
+
+    awaiting_reverify_confirmation: bool = False
+    reverify_attempts: int = 0
+    max_reverify_attempts: int = 2
+
     # =====================================================
     # GLOBAL FLOW CONTROL
     # =====================================================
@@ -141,6 +164,7 @@ class CaseState:
 
     attempts: int = 0
     max_attempts: int = 3
+    max_correction_count: int = 4
 
     # =====================================================
     # VERIFICATION / COMPLETION
@@ -162,6 +186,20 @@ class CaseState:
     conversation_turns: int = 0
 
     # =====================================================
+    # VALIDATION
+    # =====================================================
+
+    def __post_init__(self):
+        if self.max_attempts <= 0:
+            raise ValueError("max_attempts must be greater than 0")
+        if self.max_field_attempts <= 0:
+            raise ValueError("max_field_attempts must be greater than 0")
+        if self.max_correction_count <= 0:
+            raise ValueError("max_correction_count must be greater than 0")
+        if self.max_field_corrections <= 0:
+            raise ValueError("max_field_corrections must be greater than 0")
+
+    # =====================================================
     # SAFE ENTITY UPDATE
     # =====================================================
 
@@ -170,7 +208,8 @@ class CaseState:
         field_name,
         value,
         confidence=1.0,
-        source="system"
+        source="system",
+        max_length=500
     ):
 
         if value in [None, ""]:
@@ -178,7 +217,7 @@ class CaseState:
 
         value = str(value).strip()
 
-        if len(value) == 0:
+        if len(value) == 0 or len(value) > max_length:
             return False
 
         self.entities[field_name] = value
@@ -234,22 +273,21 @@ class CaseState:
         self.attempts = 0
 
     # =====================================================
-    # CONFIDENCE MANAGEMENT
+    # CONFIDENCE MANAGEMENT (with attempt decay)
     # =====================================================
 
     def reduce_confidence(self, amount=0.1):
-
-        self.confidence = max(
-            0.0,
-            self.confidence - amount
-        )
+        """Reduce confidence - penalizes failed extraction"""
+        self.confidence = max(0.0, self.confidence - amount)
 
     def increase_confidence(self, amount=0.05):
+        """Increase confidence - rewards successful extraction"""
+        self.confidence = min(1.0, self.confidence + amount)
 
-        self.confidence = min(
-            1.0,
-            self.confidence + amount
-        )
+    def apply_attempt_decay(self):
+        """Apply decay to confidence based on total attempts (call only on failure)"""
+        decay_factor = max(0.6, 1.0 - (self.attempts * 0.08))
+        self.confidence = max(0.0, self.confidence * decay_factor)
 
     # =====================================================
     # CORRECTION TRACKING
@@ -277,12 +315,18 @@ class CaseState:
         """
         reset conversational flow
         preserve entities + language
+        ✓ KEEPS: All extracted data, sentiment, confidence, language
+        ✗ CLEARS: attempts, corrections, field attempts, current field
+
+        Used for: Correction loops, high escalation score
+        Effect: User restarts but system remembers what they said before
         """
 
         self.attempts = 0
 
         self.awaiting_correction = False
         self.awaiting_new_issue = False
+        self.awaiting_reverify_confirmation = False
 
         self.current_field = None
         self.last_asked_field = None
@@ -292,6 +336,95 @@ class CaseState:
         self.just_reset = True
 
         self.stage = "collection"
+
+        self.field_attempts = {}
+        self.correction_passes = 0
+        self.fields_corrected_in_pass = []
+        self.reverify_attempts = 0
+
+    # =====================================================
+    # CORRECTION TRACKING
+    # =====================================================
+
+    def track_field_correction(self, field_name):
+        """Track corrections per field and detect drift/repetition"""
+        self.field_correction_count[field_name] = (
+            self.field_correction_count.get(field_name, 0) + 1
+        )
+
+        if field_name not in self.fields_corrected_in_pass:
+            self.fields_corrected_in_pass.append(field_name)
+
+        return self.field_correction_count[field_name]
+
+    def detect_correction_drift(self):
+        """
+        Detect if user is correcting same field too many times
+        Returns: (is_drifting, reason)
+        """
+        if not self.field_correction_count:
+            return False, None
+
+        for field_name, count in self.field_correction_count.items():
+            if count > self.max_field_corrections:
+                return True, f"Field '{field_name}' corrected {count} times"
+
+        return False, None
+
+    def detect_multi_pass_drift(self):
+        """
+        Detect if user has gone through ALL fields and is correcting again
+        Indicates uncertainty or confusion about the data
+        """
+        if not self.department_field_count or not self.fields_corrected_in_pass:
+            return False, None
+
+        unique_fields_corrected = len(self.fields_corrected_in_pass)
+
+        if unique_fields_corrected >= self.department_field_count:
+            self.correction_passes += 1
+
+            if self.correction_passes >= 2:
+                return True, f"User correcting fields for 2nd time (uncertainty)"
+
+            self.fields_corrected_in_pass = []
+
+        return False, None
+
+    def check_total_corrections_exceed_fields(self):
+        """
+        If total corrections > number of fields in department,
+        user is likely confused or uncertain
+        """
+        if not self.department_field_count:
+            return False, None
+
+        if self.correction_count > self.department_field_count:
+            return True, f"Total corrections ({self.correction_count}) exceed fields ({self.department_field_count})"
+
+        return False, None
+
+    # =====================================================
+    # LOW CONFIDENCE FIELD DETECTION
+    # =====================================================
+
+    def get_low_confidence_fields(self, threshold=0.80):
+        """
+        After soft reset, identify preserved entities with low confidence
+        Returns list of (field_name, confidence, value) tuples
+        """
+        low_conf_fields = []
+
+        for field_name, value in self.entities.items():
+            if not value:
+                continue
+
+            confidence = self.entity_confidence.get(field_name, 0.85)
+
+            if confidence < threshold:
+                low_conf_fields.append((field_name, confidence, value))
+
+        return low_conf_fields
 
     # =====================================================
     # FULL RESET
@@ -358,10 +491,6 @@ class InputAgent:
 
         return ""
 
-import json
-import re
-from openai import OpenAI
-
 
 class UnderstandingAgent:
 
@@ -378,7 +507,7 @@ class UnderstandingAgent:
         try:
             return json.loads(content)
 
-        except:
+        except (json.JSONDecodeError, ValueError, TypeError):
 
             match = re.search(
                 r"\{.*\}",
@@ -389,10 +518,123 @@ class UnderstandingAgent:
             if match:
                 try:
                     return json.loads(match.group())
-                except:
+                except (json.JSONDecodeError, ValueError, TypeError):
                     pass
 
         return {}
+
+    # =====================================================
+    # RISK KEYWORD DETECTION
+    # =====================================================
+
+    def detect_risk_indicators(self, text):
+        """Detect abuse/danger keywords and escalate sentiment"""
+        text_lower = str(text or "").lower()
+
+        critical_keywords = ["abuse", "assault", "violence", "weapon", "gun", "knife"]
+        danger_keywords = [
+            "threat", "threatened", "threatening", "threaten",
+            "attack", "violent",
+            "scared", "afraid", "fear", "terrified",
+            "hurt", "harm", "injury", "injure"
+        ]
+        concern_keywords = [
+            "hit", "beat", "punch", "kick", "slap",
+            "aggressive", "dangerous", "danger"
+        ]
+
+        def word_in_text(word):
+            return re.search(r'\b' + re.escape(word) + r'\b', text_lower)
+
+        def is_negated(word):
+            match = re.search(r'\b(not|no|don\'t|didn\'t|isn\'t|aren\'t|wasn\'t|weren\'t)\s+\w+\s+' + re.escape(word), text_lower)
+            return match is not None
+
+        critical_count = sum(1 for kw in critical_keywords if word_in_text(kw) and not is_negated(kw))
+        danger_count = sum(1 for kw in danger_keywords if word_in_text(kw) and not is_negated(kw))
+        concern_count = sum(1 for kw in concern_keywords if word_in_text(kw) and not is_negated(kw))
+
+        if critical_count >= 1 or danger_count >= 2:
+            return "high"
+
+        if danger_count >= 1 or concern_count >= 2:
+            return "medium_high"
+
+        if concern_count >= 1:
+            return "medium_high"
+
+        return None
+
+    # =====================================================
+    # FRUSTRATION & CONFUSION DETECTION
+    # =====================================================
+
+    def detect_frustration(self, text, state=None):
+        """Detect explicit frustration, confusion, and fatigue signals"""
+        text_lower = str(text or "").lower()
+
+        explicit_frustration = [
+            "frustrat", "annoyed", "annoying", "annoyed", "tired of",
+            "fed up", "enough", "stop", "quit", "give up",
+            "waste time", "waste my time", "pointless",
+            "ridiculous", "ridiculos", "absurd", "unacceptable",
+            "angry", "furious", "enraged", "mad",
+            "upset", "unhappy", "dissatisfied",
+            "irritated", "irritating",
+            "exhausted", "exhausting",
+            "sick of", "sick and tired"
+        ]
+
+        confusion_phrases = [
+            "can't understand", "cannot understand", "don't understand",
+            "cannot understand",
+            "can't figure", "can't make sense",
+            "confusing", "confused", "confuse me",
+            "unclear", "not clear", "vague",
+            "what does", "what do you mean", "what are you asking",
+            "too complicated", "too complex", "too many",
+            "complicated", "complex", "bewildering"
+        ]
+
+        incompleteness = [
+            "don't know", "don't know what", "don't know how",
+            "can't", "cannot", "unable to",
+            "can't provide", "can't help",
+            "not sure", "unsure", "no idea"
+        ]
+
+        def find_phrase(phrases):
+            return any(re.search(r'\b' + re.escape(phrase) + r'\b', text_lower) for phrase in phrases)
+
+        frustration_count = sum(1 for phrase in explicit_frustration if find_phrase([phrase]))
+        confusion_count = sum(1 for phrase in confusion_phrases if find_phrase([phrase]))
+        incompleteness_count = sum(1 for phrase in incompleteness if find_phrase([phrase]))
+
+        # Explicit frustration triggers high immediately
+        if frustration_count >= 1:
+            return "high"
+
+        # Multiple confusion signals trigger high
+        if confusion_count >= 2 or incompleteness_count >= 2:
+            return "high"
+
+        # Single confusion signal = medium_high
+        if confusion_count >= 1 or incompleteness_count >= 1:
+            return "medium_high"
+
+        return None
+
+    # =====================================================
+    # REPETITION DETECTION
+    # =====================================================
+
+    def detect_repetition_fatigue(self, state):
+        """Detect if same field has been asked multiple times"""
+        if not state.current_field or not state.field_attempts:
+            return False
+
+        field_attempt_count = state.field_attempts.get(state.current_field, 0)
+        return field_attempt_count >= 3
 
     # =====================================================
     # NORMALIZATION
@@ -538,6 +780,92 @@ class UnderstandingAgent:
     # FIELD EXTRACTION
     # =====================================================
 
+    def _extract_context_keywords(self, text, target_field):
+        """Extract values using field-specific keyword patterns with word boundaries"""
+        text_lower = text.lower().strip()
+        text_words = text_lower.split()
+
+        # =====================================================
+        # SIMPLE "IT'S [VALUE]" OR "ITS [VALUE]" PATTERN
+        # =====================================================
+        # Handle simple statements like "it's house" or "its house"
+        if text_lower.startswith("it's ") or text_lower.startswith("its "):
+            # Extract everything after "it's" or "its"
+            if text_lower.startswith("it's "):
+                value = text[5:].strip()  # Skip "it's "
+            else:
+                value = text[4:].strip()  # Skip "its "
+
+            # Only return if it's reasonably short (not a full sentence)
+            if value and len(value.split()) <= 3:
+                return value
+
+        if "date_time" in target_field:
+            # Extract date AND time
+            date_keywords = ["yesterday", "today", "tomorrow", "tonight", "last night"]
+            time_keywords = ["morning", "afternoon", "evening", "night", "noon", "midnight"]
+
+            # Check for explicit date + time combinations
+            for date_kw in date_keywords:
+                if date_kw in text_lower:
+                    for time_kw in time_keywords:
+                        if time_kw in text_lower:
+                            return f"{date_kw} {time_kw}"
+                    return date_kw
+
+            # Check for time alone
+            for time_kw in time_keywords:
+                if time_kw in text_lower:
+                    return time_kw
+
+        elif "date" in target_field:
+            date_keywords = [
+                "yesterday", "today", "tomorrow",
+                "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+                "last week", "this week", "next week",
+                "last month", "this month", "next month",
+                "last year", "this year", "next year",
+                "tonight", "last night"
+            ]
+
+            for kw in date_keywords:
+                if kw in text_lower:
+                    return kw
+
+        elif "time" in target_field:
+            time_keywords = [
+                "morning", "afternoon", "evening", "night", "noon", "midnight",
+                "early", "late", "dawn", "dusk", "sunset", "sunrise"
+            ]
+
+            for kw in time_keywords:
+                if kw in text_lower:
+                    return kw
+
+        elif "location" in target_field or "place" in target_field or "address" in target_field:
+            location_keywords = [
+                "house", "home", "office", "street", "park", "restaurant",
+                "store", "bank", "hospital", "station", "apartment", "building",
+                "school", "college", "university", "mall", "market", "shop",
+                "clinic", "pharmacy", "hotel", "cafe", "gym", "library",
+                "church", "temple", "mosque", "beach", "mountain", "lake",
+                "road", "avenue", "lane", "plaza", "square", "compound"
+            ]
+
+            # Try substring matching first (more reliable)
+            for kw in location_keywords:
+                if kw in text_lower:
+                    # Find the word in the text and extract with context
+                    kw_idx = text_lower.find(kw)
+                    if kw_idx != -1:
+                        # Get context around the keyword
+                        start = max(0, kw_idx - 30)
+                        end = min(len(text), kw_idx + len(kw) + 30)
+                        context = text[start:end].strip()
+                        return context
+
+        return None
+
     def extract_field(
         self,
         text,
@@ -549,6 +877,41 @@ class UnderstandingAgent:
             target_field,
             state
         )
+
+        keyword_match = self._extract_context_keywords(text, target_field)
+        if keyword_match:
+            return {target_field: keyword_match}
+
+        # =================================================
+        # CHECK FOR "I DON'T KNOW" / "CAN'T HELP" PHRASES
+        # =================================================
+        # Treat as valid answer that doesn't fail extraction
+
+        text_lower = str(text or "").lower().strip()
+        unknown_phrases = [
+            "i don't know",
+            "i dont know",
+            "don't know",
+            "dont know",
+            "no idea",
+            "not sure",
+            "unsure",
+            "i don't understand",
+            "i dont understand",
+            "don't understand",
+            "dont understand",
+            "i don't get it",
+            "i dont get it",
+            "i can't help",
+            "i cant help",
+            "can't help",
+            "cant help",
+            "not available",
+            "unknown"
+        ]
+
+        if any(phrase in text_lower for phrase in unknown_phrases):
+            return {target_field: "unknown"}
 
         # =================================================
         # DETERMINISTIC BOOLEAN EXTRACTION
@@ -590,6 +953,23 @@ class UnderstandingAgent:
         # LLM FIELD EXTRACTION
         # =================================================
 
+        # Special instructions for date/time fields
+        date_time_instructions = ""
+        if "date" in target_field.lower() or "time" in target_field.lower():
+            date_time_instructions = """
+SPECIAL INSTRUCTIONS FOR DATE/TIME:
+- Extract relative dates: yesterday, today, tomorrow, last week, next month, etc.
+- Extract days: monday, tuesday, wednesday, thursday, friday, saturday, sunday
+- Extract times: morning, afternoon, evening, night, noon, midnight, dawn, dusk
+- Preserve exact phrasing (e.g., "last night", "this afternoon", "next week")
+- Examples:
+  * "it happened yesterday" → "yesterday"
+  * "yesterday evening" → "yesterday evening"
+  * "last week friday" → "last week friday"
+  * "this morning at 9am" → "this morning"
+- Do NOT try to convert to dates, just preserve the natural language
+"""
+
         prompt = f"""
 You are extracting a structured field value.
 
@@ -609,6 +989,7 @@ Rules:
 - Do NOT invent values
 - Preserve natural language time expressions
 - If unclear return empty JSON
+{date_time_instructions}
 
 Format:
 {{"{target_field}": "value"}}
@@ -619,7 +1000,7 @@ OR
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -698,7 +1079,7 @@ OR
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -758,7 +1139,7 @@ Input:
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -904,6 +1285,16 @@ Input:
                 result.get("sentiment")
             )
 
+        risk_sentiment = self.detect_risk_indicators(state.last_user_message)
+        if risk_sentiment:
+            if state.sentiment != "high":
+                state.sentiment = risk_sentiment
+
+        frustration_sentiment = self.detect_frustration(state.last_user_message, state)
+        if frustration_sentiment:
+            if state.sentiment != "high":
+                state.sentiment = frustration_sentiment
+
         if result.get("confidence") is not None:
 
             state.confidence = (
@@ -929,10 +1320,6 @@ Input:
 
         return state
 
-import json
-import re
-from openai import OpenAI
-
 
 class CaseBuilderAgent:
 
@@ -954,7 +1341,7 @@ class CaseBuilderAgent:
         try:
             return json.loads(content)
 
-        except:
+        except (json.JSONDecodeError, ValueError, TypeError):
 
             match = re.search(
                 r"\{.*\}",
@@ -965,10 +1352,67 @@ class CaseBuilderAgent:
             if match:
                 try:
                     return json.loads(match.group())
-                except:
+                except (json.JSONDecodeError, ValueError, TypeError):
                     pass
 
         return {}
+
+    # =====================================================
+    # VALUE FORMATTING & FALLBACK
+    # =====================================================
+
+    def format_extracted_value(self, value, field_name):
+        """Compact and clean extracted values - always returns a value"""
+        if not value:
+            return None
+
+        value_str = str(value).strip()
+
+        if not value_str:
+            return None
+
+        if "accused" in field_name.lower() or "suspect" in field_name.lower():
+            if any(word in value_str.lower() for word in ["i don't know", "unknown", "no one", "nobody"]):
+                return "Unknown perpetrator"
+            return value_str[:100] if len(value_str) > 100 else value_str
+
+        if "date" in field_name.lower() or "time" in field_name.lower():
+            return value_str.lower()
+
+        if "location" in field_name.lower() or "place" in field_name.lower():
+            return value_str
+
+        if "danger" in field_name.lower() or "risk" in field_name.lower():
+            normalized = value_str.lower()
+            if normalized in ["yes", "true", "y"]:
+                return "yes"
+            if normalized in ["no", "false", "n"]:
+                return "no"
+            return value_str
+
+        return value_str[:200] if len(value_str) > 200 else value_str
+
+    def check_fallback_acceptable(self, user_text, field_name):
+        """Check if user explicitly said value is unknown/not applicable"""
+        text_lower = user_text.lower().strip()
+
+        not_applicable = [
+            "n/a", "not applicable", "doesn't apply",
+            "not relevant", "skip this", "doesn't matter"
+        ]
+
+        not_known = [
+            "i don't know", "unknown", "don't know",
+            "no clue", "no idea", "can't say", "not sure"
+        ]
+
+        if any(phrase in text_lower for phrase in not_applicable):
+            return "not_applicable"
+
+        if any(phrase in text_lower for phrase in not_known):
+            return "unknown"
+
+        return None
 
     # =====================================================
     # DEPARTMENT LOOKUP
@@ -1149,7 +1593,7 @@ Return ONLY JSON.
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -1215,7 +1659,7 @@ OR
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -1419,15 +1863,17 @@ OR
                 {}
             ).items():
 
-                state.update_entity(
-                    field_name=field,
-                    value=value,
-                    confidence=extracted.get(
-                        "confidence",
-                        0.8
-                    ),
-                    source="global_extraction"
-                )
+                formatted_value = self.format_extracted_value(value, field)
+                if formatted_value:
+                    state.update_entity(
+                        field_name=field,
+                        value=formatted_value,
+                        confidence=extracted.get(
+                            "confidence",
+                            0.85
+                        ),
+                        source="global_extraction"
+                    )
 
         # =================================================
         # CORRECTION UPDATE
@@ -1440,19 +1886,45 @@ OR
                 if field.startswith("__"):
                     continue
 
-                updated = state.update_entity(
-                    field_name=field,
-                    value=value,
-                    confidence=0.95,
-                    source="correction"
-                )
-
-                if updated:
-                    state.register_correction(
-                        field
+                formatted_value = self.format_extracted_value(value, field)
+                if formatted_value:
+                    updated = state.update_entity(
+                        field_name=field,
+                        value=formatted_value,
+                        confidence=0.95,
+                        source="correction"
                     )
 
+                    if updated:
+                        state.register_correction(
+                            field
+                        )
+                        state.track_field_correction(
+                            field
+                        )
+
             state.reduce_confidence(0.05)
+
+        # =================================================
+        # REVERIFY UPDATE (after soft reset)
+        # Does NOT inflate correction metrics
+        # =================================================
+
+        elif mode == "reverify":
+
+            for field, value in extracted.items():
+
+                if field.startswith("__"):
+                    continue
+
+                formatted_value = self.format_extracted_value(value, field)
+                if formatted_value:
+                    state.update_entity(
+                        field_name=field,
+                        value=formatted_value,
+                        confidence=0.95,
+                        source="reverify"
+                    )
 
         # =================================================
         # NORMAL UPDATE
@@ -1465,12 +1937,14 @@ OR
                 if field.startswith("__"):
                     continue
 
-                state.update_entity(
-                    field_name=field,
-                    value=value,
-                    confidence=0.9,
-                    source="normal_update"
-                )
+                formatted_value = self.format_extracted_value(value, field)
+                if formatted_value:
+                    state.update_entity(
+                        field_name=field,
+                        value=formatted_value,
+                        confidence=0.9,
+                        source="normal_update"
+                    )
 
             state.increase_confidence(0.05)
 
@@ -1495,6 +1969,9 @@ OR
                 state.department = (
                     department["name"]
                 )
+                state.department_field_count = len(
+                    department.get("required_fields", [])
+                )
 
         else:
 
@@ -1503,6 +1980,10 @@ OR
                     state.department
                 )
             )
+            if department:
+                state.department_field_count = len(
+                    department.get("required_fields", [])
+                )
 
         # -------------------------------------------------
         # NO DEPARTMENT FOUND
@@ -1601,7 +2082,7 @@ Instruction:
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -1784,6 +2265,70 @@ Ask the user to provide:
                 instruction
             ),
             "action": "ask_field",
+            "field": field_name
+        }
+
+    # =====================================================
+    # RE-VERIFY LOW CONFIDENCE FIELDS (after soft reset)
+    # =====================================================
+
+    def ask_reverify_low_confidence(self, state, confidence_threshold=0.80):
+
+        low_conf_fields = state.get_low_confidence_fields(threshold=confidence_threshold)
+
+        if not low_conf_fields:
+            return None
+
+        state.last_action = "reverify_low_confidence"
+        state.awaiting_reverify_confirmation = True
+        state.reverify_attempts = 0
+
+        field_name, confidence, value = low_conf_fields[0]
+
+        state.current_field = field_name
+        state.last_asked_field = field_name
+
+        nice_field = self.humanize(field_name)
+
+        instruction = f"""
+Before we continue, I want to double-check a detail.
+
+You mentioned {nice_field} as: {value}
+
+Is that correct?
+"""
+
+        return {
+            "text": self.gen(
+                state,
+                instruction
+            ),
+            "action": "reverify_field",
+            "field": field_name
+        }
+
+    # =====================================================
+    # ASK FOR CORRECTED VALUE DURING REVERIFY
+    # =====================================================
+
+    def ask_reverify_correction(self, state):
+
+        field_name = state.current_field
+        nice_field = self.humanize(field_name)
+
+        instruction = f"""
+What is the correct value for {nice_field}?
+"""
+
+        state.last_action = "reverify_correction"
+        state.reverify_attempts += 1
+
+        return {
+            "text": self.gen(
+                state,
+                instruction
+            ),
+            "action": "reverify_correction",
             "field": field_name
         }
 
@@ -2040,10 +2585,6 @@ further assistance.
             "action": "handover"
         }
 
-import json
-import re
-from openai import OpenAI
-
 
 class VerificationAgent:
 
@@ -2089,7 +2630,7 @@ Return text only.
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -2370,10 +2911,6 @@ DEPARTMENTS = [
     }
 ]
 
-import json
-import re
-from openai import OpenAI
-
 
 class DecisionAgent:
 
@@ -2390,7 +2927,7 @@ class DecisionAgent:
         try:
             return json.loads(content)
 
-        except:
+        except (json.JSONDecodeError, ValueError, TypeError):
 
             match = re.search(
                 r"\{.*\}",
@@ -2401,7 +2938,7 @@ class DecisionAgent:
             if match:
                 try:
                     return json.loads(match.group())
-                except:
+                except (json.JSONDecodeError, ValueError, TypeError):
                     pass
 
         return {}
@@ -2718,7 +3255,7 @@ Format:
 """
 
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-turbo",
             messages=[
                 {
                     "role": "user",
@@ -2809,6 +3346,19 @@ class Pipeline:
         departments
     ):
 
+        if not api_key or not isinstance(api_key, str):
+            raise ValueError("api_key must be a non-empty string")
+
+        if not departments or not isinstance(departments, list):
+            raise ValueError("departments must be a non-empty list")
+
+        for dept in departments:
+            if not isinstance(dept, dict):
+                raise ValueError("Each department must be a dictionary")
+            required_keys = {"name", "code", "required_fields"}
+            if not required_keys.issubset(dept.keys()):
+                raise ValueError(f"Department missing required keys: {required_keys}")
+
         self.input = InputAgent()
 
         self.u = UnderstandingAgent(api_key)
@@ -2835,76 +3385,97 @@ class Pipeline:
 
         t = str(text or "").lower().strip()
 
-        # -------------------------------------------------
-        # USER REQUESTED HUMAN
-        # -------------------------------------------------
-
         human_keywords = [
-            "human",
-            "agent",
-            "representative",
-            "real person"
+            "human", "agent", "representative", "real person"
         ]
 
         if any(word in t for word in human_keywords):
-
             return {
                 "action": "handover",
                 "reason": "user_requested_human"
             }
 
-        # -------------------------------------------------
-        # EXCESSIVE FAILURES
-        # -------------------------------------------------
+        # =====================================================
+        # DIRECT ATTEMPTS THRESHOLD CHECK
+        # =====================================================
+        # If attempts exceed max, escalate immediately
+        # Don't wait for sentiment or escalation score
 
-        if state.attempts >= state.max_attempts:
-
+        if state.attempts > state.max_attempts:
+            state.sentiment = "high"
             return {
                 "action": "handover",
-                "reason": "too_many_attempts"
+                "reason": "max_attempts_exceeded"
             }
 
-        # -------------------------------------------------
-        # HIGH DISTRESS + FAILURES
-        # -------------------------------------------------
+        if self.u.detect_repetition_fatigue(state):
+            state.sentiment = "high"
 
-        if (
-            state.sentiment == "high"
-            and state.attempts >= 2
-        ):
+        is_field_drift, drift_reason = state.detect_correction_drift()
+        if is_field_drift:
+            state.sentiment = "high"
+            if DEBUG:
+                logger.debug(f"Correction drift detected: {drift_reason}")
 
+        is_multi_pass, multi_pass_reason = state.detect_multi_pass_drift()
+        if is_multi_pass:
+            state.sentiment = "high"
+            if DEBUG:
+                logger.debug(f"Multi-pass drift detected: {multi_pass_reason}")
+
+        exceeds_fields, exceed_reason = state.check_total_corrections_exceed_fields()
+        if exceeds_fields:
+            state.sentiment = "high"
+            if DEBUG:
+                logger.debug(f"Corrections exceed fields: {exceed_reason}")
+
+        escalation_score = self._calculate_escalation_score(state)
+
+        if escalation_score >= 0.75:
             return {
                 "action": "handover",
-                "reason": "high_distress"
+                "reason": "escalation_score_critical"
             }
 
-        # -------------------------------------------------
-        # TOO MANY CORRECTIONS
-        # -------------------------------------------------
-
-        if state.correction_count >= 4:
-
+        if escalation_score >= 0.55 and not state.just_reset:
             return {
-                "action": "handover",
-                "reason": "too_many_corrections"
+                "action": "reset",
+                "reason": "escalation_score_high"
             }
-
-        # -------------------------------------------------
-        # RESET FLOW
-        # -------------------------------------------------
 
         if (
             state.awaiting_correction
             and state.attempts >= 2
             and not state.just_reset
         ):
-
             return {
                 "action": "reset",
                 "reason": "correction_loop"
             }
 
         return None
+
+    def _calculate_escalation_score(self, state):
+        """Weighted scoring: (attempts*0.4) + (corrections*0.3) + (sentiment*0.3)"""
+        attempt_score = min(1.0, state.attempts / state.max_attempts)
+        correction_score = min(1.0, state.correction_count / float(state.max_correction_count))
+
+        if state.sentiment == "high":
+            sentiment_score = 0.7
+        elif state.sentiment == "medium_high":
+            sentiment_score = 0.4
+        elif state.sentiment is not None:
+            sentiment_score = 0.1
+        else:
+            sentiment_score = 0.05
+
+        total_score = (
+            attempt_score * 0.4 +
+            correction_score * 0.3 +
+            sentiment_score * 0.3
+        )
+
+        return total_score
 
     # =====================================================
     # VERIFICATION RESPONSE
@@ -3003,17 +3574,13 @@ class Pipeline:
 
             if action == "reset":
 
-                state.soft_reset()
-
                 state.awaiting_new_issue = True
 
+                # NOTE: ask_rephrase() calls soft_reset() internally
                 return (
                     state,
                     self.i.ask_rephrase(state)
                 )
-
-        # reset marker after stable turn
-        state.just_reset = False
 
         # =================================================
         # INITIAL CASE EXTRACTION
@@ -3025,6 +3592,7 @@ class Pipeline:
         ):
 
             state.awaiting_new_issue = False
+            state.just_reset = False
 
             extracted = self.u.extract(
                 text,
@@ -3041,6 +3609,20 @@ class Pipeline:
                 extracted,
                 mode="global"
             )
+
+            # ---------------------------------------------
+            # RE-VERIFY LOW CONFIDENCE FIELDS (after soft reset)
+            # ---------------------------------------------
+
+            if state.just_reset:
+
+                reverify_response = self.i.ask_reverify_low_confidence(state)
+
+                if reverify_response:
+                    return (state, reverify_response)
+
+                # No low-confidence fields to reverify
+                state.just_reset = False
 
             # ---------------------------------------------
             # ASK MISSING FIELDS
@@ -3062,6 +3644,156 @@ class Pipeline:
                 self.build_verification_response(
                     state
                 )
+            )
+
+        # =================================================
+        # REVERIFY RESPONSE (after soft reset)
+        # =================================================
+
+        if state.last_action == "reverify_low_confidence":
+
+            target_field = state.current_field
+
+            # Check for escalation signals during reverification
+            control = self.apply_control(state, text)
+            if control:
+                return (state, control)
+
+            t_norm = self.d.normalize(text)
+
+            # CASE 1: User confirms the value
+            if self.d.is_pure_yes(t_norm):
+                state.entity_confidence[target_field] = 0.95
+                state.awaiting_reverify_confirmation = False
+                state.reverify_attempts = 0
+                state.last_action = None
+
+            # CASE 2: User provides explicit correction
+            elif self.d.detect_explicit_correction(t_norm):
+                extracted = self.u.extract(
+                    text,
+                    mode="field",
+                    target_field=target_field,
+                    state=state
+                )
+
+                if extracted:
+                    # Use reverify mode to avoid correction inflation
+                    self.c.update_case(
+                        state,
+                        extracted,
+                        mode="reverify"
+                    )
+                    state.entity_confidence[target_field] = 0.95
+                    state.awaiting_reverify_confirmation = False
+                    state.reverify_attempts = 0
+                    state.last_action = None
+                else:
+                    # Extraction failed, ask again
+                    return (
+                        state,
+                        self.i.ask_reverify_correction(state)
+                    )
+
+            # CASE 3: User rejects but doesn't provide correction yet
+            elif self.d.is_pure_rejection(t_norm):
+                # Ask user to provide the correct value
+                return (
+                    state,
+                    self.i.ask_reverify_correction(state)
+                )
+
+            # CASE 4: Vague/uncertain response
+            else:
+                # Treat as rejection and ask for correction
+                return (
+                    state,
+                    self.i.ask_reverify_correction(state)
+                )
+
+            # Check for more low-confidence fields
+            reverify_response = self.i.ask_reverify_low_confidence(state)
+
+            if reverify_response:
+                return (state, reverify_response)
+
+            # No more low-confidence fields found
+            state.just_reset = False
+
+            # Continue with missing fields
+            if state.missing_fields:
+                return (
+                    state,
+                    self.i.ask_missing(state)
+                )
+
+            # All fields done, go to verification
+            return (
+                state,
+                self.build_verification_response(state)
+            )
+
+        # =================================================
+        # REVERIFY CORRECTION RESPONSE
+        # =================================================
+
+        if state.last_action == "reverify_correction":
+
+            target_field = state.current_field
+
+            # Check for escalation signals
+            control = self.apply_control(state, text)
+            if control:
+                return (state, control)
+
+            # Check attempt limit
+            if state.reverify_attempts >= state.max_reverify_attempts:
+                state.sentiment = "high"
+                return (state, self.i.ask_rephrase(state))
+
+            extracted = self.u.extract(
+                text,
+                mode="field",
+                target_field=target_field,
+                state=state
+            )
+
+            # Valid correction provided
+            if extracted:
+                self.c.update_case(
+                    state,
+                    extracted,
+                    mode="reverify"
+                )
+                state.entity_confidence[target_field] = 0.95
+                state.awaiting_reverify_confirmation = False
+                state.reverify_attempts = 0
+                state.last_action = None
+
+                # Check for more low-confidence fields
+                reverify_response = self.i.ask_reverify_low_confidence(state)
+
+                if reverify_response:
+                    return (state, reverify_response)
+
+                # No more low-confidence fields
+                state.just_reset = False
+
+                if state.missing_fields:
+                    return (
+                        state,
+                        self.i.ask_missing(state)
+                    )
+
+                return (
+                    state,
+                    self.build_verification_response(state)
+                )
+
+            # Invalid correction, ask again
+            return (
+                state,
+                self.i.ask_reverify_correction(state)
             )
 
         # =================================================
@@ -3134,6 +3866,10 @@ class Pipeline:
                 extracted,
                 mode="normal"
             )
+
+            # Explicitly increase confidence on successful fill
+            # (should already happen in update_case, but ensuring here)
+            state.increase_confidence(0.02)
 
             # ---------------------------------------------
             # MORE FIELDS REMAIN
@@ -3350,7 +4086,8 @@ class Pipeline:
             state,
             {
                 "text": (
-                    "Could you please clarify?"
+                    "I'm not sure what you mean. "
+                    "Could you please clarify your complaint or use 'restart' to begin a new case?"
                 ),
                 "action": "clarify"
             }
@@ -3377,18 +4114,10 @@ while True:
     # 🖨️ Bot response
     print("\nBot:", response.get("text"))
 
-    # 🧠 DEBUG (VERY IMPORTANT)
-    print("\n--- STATE ---")
-    print(state)
-
-    print("\n--- DEBUG SIGNALS ---")
-    print({
-        "attempts": state.attempts,
-        "correction_count": state.correction_count,
-        "last_corrected_field": state.last_corrected_field,
-        "awaiting_correction": state.awaiting_correction,
-        "just_reset": state.just_reset,
-        "sentiment": state.sentiment
-    })
-
-    print("\n" + "="*60 + "\n")
+    # 🧠 DEBUG OUTPUT (controlled by DEBUG flag)
+    if DEBUG:
+        logger.debug(f"STATE: {state}")
+        logger.debug(f"DEBUG_SIGNALS: {{'attempts': {state.attempts}, 'correction_count': {state.correction_count}, 'last_corrected_field': {state.last_corrected_field}, 'awaiting_correction': {state.awaiting_correction}, 'just_reset': {state.just_reset}, 'sentiment': {state.sentiment}}}")
+        print("\n" + "="*60 + "\n")
+    else:
+        print()  # Just add a newline for spacing
