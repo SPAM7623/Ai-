@@ -254,22 +254,23 @@ class CaseState:
         self.attempts = 0
 
     # =====================================================
-    # CONFIDENCE MANAGEMENT
+    # CONFIDENCE MANAGEMENT (with attempt decay)
     # =====================================================
 
     def reduce_confidence(self, amount=0.1):
-
-        self.confidence = max(
-            0.0,
-            self.confidence - amount
-        )
+        """Reduce confidence - penalizes failed extraction"""
+        penalty = amount + (self.attempts * 0.05)
+        self.confidence = max(0.0, self.confidence - penalty)
 
     def increase_confidence(self, amount=0.05):
+        """Increase confidence - rewards successful extraction"""
+        bonus = amount + (0.05 if self.attempts == 0 else 0)
+        self.confidence = min(1.0, self.confidence + bonus)
 
-        self.confidence = min(
-            1.0,
-            self.confidence + amount
-        )
+    def apply_attempt_decay(self):
+        """Apply decay to confidence based on total attempts"""
+        decay_factor = 1.0 - (self.attempts * 0.08)
+        self.confidence = max(0.0, self.confidence * decay_factor)
 
     # =====================================================
     # CORRECTION TRACKING
@@ -409,6 +410,40 @@ class UnderstandingAgent:
                     pass
 
         return {}
+
+    # =====================================================
+    # RISK KEYWORD DETECTION
+    # =====================================================
+
+    def detect_risk_indicators(self, text):
+        """Detect abuse/danger keywords and escalate sentiment"""
+        text_lower = str(text or "").lower()
+
+        abuse_keywords = [
+            "abuse", "hit", "beat", "punch", "kick", "slap",
+            "threat", "threatened", "threatening", "threaten",
+            "assault", "attack", "violence", "violent",
+            "tough", "aggressive", "dangerous", "danger",
+            "scared", "afraid", "fear", "terrified",
+            "hurt", "harm", "injury", "injure",
+            "weapon", "gun", "knife",
+            "police", "call police", "help"
+        ]
+
+        detected_keywords = [
+            kw for kw in abuse_keywords
+            if kw in text_lower
+        ]
+
+        if len(detected_keywords) >= 2 or any(
+            kw in text_lower for kw in ["abuse", "assault", "violence", "threat"]
+        ):
+            return "high"
+
+        if detected_keywords:
+            return "medium_high"
+
+        return None
 
     # =====================================================
     # NORMALIZATION
@@ -554,6 +589,25 @@ class UnderstandingAgent:
     # FIELD EXTRACTION
     # =====================================================
 
+    def _extract_context_keywords(self, text, target_field):
+        """Extract values using field-specific keyword patterns"""
+        text_lower = text.lower().strip()
+
+        date_keywords = ["yesterday", "today", "tomorrow", "last", "next", "on", "at", "when"]
+        location_keywords = ["at", "in", "near", "located", "place", "house", "street", "area"]
+
+        if "date" in target_field or "time" in target_field:
+            for kw in date_keywords:
+                if kw in text_lower:
+                    return text.strip()
+
+        if "location" in target_field or "place" in target_field:
+            for kw in location_keywords:
+                if kw in text_lower:
+                    return text.strip()
+
+        return None
+
     def extract_field(
         self,
         text,
@@ -565,6 +619,10 @@ class UnderstandingAgent:
             target_field,
             state
         )
+
+        keyword_match = self._extract_context_keywords(text, target_field)
+        if keyword_match:
+            return {target_field: keyword_match}
 
         # =================================================
         # DETERMINISTIC BOOLEAN EXTRACTION
@@ -920,6 +978,10 @@ Input:
                 result.get("sentiment")
             )
 
+        risk_sentiment = self.detect_risk_indicators(state.last_user_message)
+        if risk_sentiment:
+            state.sentiment = risk_sentiment
+
         if result.get("confidence") is not None:
 
             state.confidence = (
@@ -981,6 +1043,60 @@ class CaseBuilderAgent:
                     pass
 
         return {}
+
+    # =====================================================
+    # VALUE FORMATTING & FALLBACK
+    # =====================================================
+
+    def format_extracted_value(self, value, field_name):
+        """Compact and clean extracted values"""
+        if not value:
+            return None
+
+        value_str = str(value).strip()
+
+        if "accused" in field_name.lower() or "suspect" in field_name.lower():
+            if any(word in value_str.lower() for word in ["i don't know", "unknown", "no one", "nobody"]):
+                return "Unknown perpetrator"
+            return value_str[:100]
+
+        if "date" in field_name.lower() or "time" in field_name.lower():
+            return value_str.lower()
+
+        if "location" in field_name.lower() or "place" in field_name.lower():
+            return value_str
+
+        if "danger" in field_name.lower() or "risk" in field_name.lower():
+            normalized = value_str.lower()
+            if normalized in ["yes", "true", "y"]:
+                return "yes"
+            if normalized in ["no", "false", "n"]:
+                return "no"
+            return value_str
+
+        return value_str[:200]
+
+    def check_fallback_acceptable(self, user_text, field_name):
+        """Check if user explicitly said value is unknown/not applicable"""
+        text_lower = user_text.lower().strip()
+
+        not_applicable = [
+            "n/a", "not applicable", "doesn't apply",
+            "not relevant", "skip this", "doesn't matter"
+        ]
+
+        not_known = [
+            "i don't know", "unknown", "don't know",
+            "no clue", "no idea", "can't say", "not sure"
+        ]
+
+        if any(phrase in text_lower for phrase in not_applicable):
+            return "not_applicable"
+
+        if any(phrase in text_lower for phrase in not_known):
+            return "unknown"
+
+        return None
 
     # =====================================================
     # DEPARTMENT LOOKUP
@@ -2852,76 +2968,59 @@ class Pipeline:
 
         t = str(text or "").lower().strip()
 
-        # -------------------------------------------------
-        # USER REQUESTED HUMAN
-        # -------------------------------------------------
-
         human_keywords = [
-            "human",
-            "agent",
-            "representative",
-            "real person"
+            "human", "agent", "representative", "real person"
         ]
 
         if any(word in t for word in human_keywords):
-
             return {
                 "action": "handover",
                 "reason": "user_requested_human"
             }
 
-        # -------------------------------------------------
-        # EXCESSIVE FAILURES
-        # -------------------------------------------------
+        state.apply_attempt_decay()
 
-        if state.attempts >= state.max_attempts:
+        escalation_score = self._calculate_escalation_score(state)
 
+        if escalation_score >= 0.75:
             return {
                 "action": "handover",
-                "reason": "too_many_attempts"
+                "reason": "escalation_score_critical"
             }
 
-        # -------------------------------------------------
-        # HIGH DISTRESS + FAILURES
-        # -------------------------------------------------
-
-        if (
-            state.sentiment == "high"
-            and state.attempts >= 2
-        ):
-
+        if escalation_score >= 0.55 and not state.just_reset:
             return {
-                "action": "handover",
-                "reason": "high_distress"
+                "action": "reset",
+                "reason": "escalation_score_high"
             }
-
-        # -------------------------------------------------
-        # TOO MANY CORRECTIONS
-        # -------------------------------------------------
-
-        if state.correction_count >= 4:
-
-            return {
-                "action": "handover",
-                "reason": "too_many_corrections"
-            }
-
-        # -------------------------------------------------
-        # RESET FLOW
-        # -------------------------------------------------
 
         if (
             state.awaiting_correction
             and state.attempts >= 2
             and not state.just_reset
         ):
-
             return {
                 "action": "reset",
                 "reason": "correction_loop"
             }
 
         return None
+
+    def _calculate_escalation_score(self, state):
+        """Weighted scoring: (attempts*0.4) + (corrections*0.3) + (sentiment*0.3)"""
+        attempt_score = min(1.0, state.attempts / state.max_attempts)
+        correction_score = min(1.0, state.correction_count / 4.0)
+        sentiment_score = 0.7 if state.sentiment == "high" else (
+            0.4 if state.sentiment == "medium_high" else 0.1
+        )
+
+        total_score = (
+            attempt_score * 0.4 +
+            correction_score * 0.3 +
+            sentiment_score * 0.3
+        )
+
+        return total_score
 
     # =====================================================
     # VERIFICATION RESPONSE
