@@ -841,6 +841,37 @@ class UnderstandingAgent:
             return {target_field: keyword_match}
 
         # =================================================
+        # CHECK FOR "I DON'T KNOW" / "CAN'T HELP" PHRASES
+        # =================================================
+        # Treat as valid answer that doesn't fail extraction
+
+        text_lower = str(text or "").lower().strip()
+        unknown_phrases = [
+            "i don't know",
+            "i dont know",
+            "don't know",
+            "dont know",
+            "no idea",
+            "not sure",
+            "unsure",
+            "i don't understand",
+            "i dont understand",
+            "don't understand",
+            "dont understand",
+            "i don't get it",
+            "i dont get it",
+            "i can't help",
+            "i cant help",
+            "can't help",
+            "cant help",
+            "not available",
+            "unknown"
+        ]
+
+        if any(phrase in text_lower for phrase in unknown_phrases):
+            return {target_field: "unknown"}
+
+        # =================================================
         # DETERMINISTIC BOOLEAN EXTRACTION
         # =================================================
 
