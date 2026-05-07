@@ -7,8 +7,17 @@ Original file is located at
     https://colab.research.google.com/drive/19nlVdnJHKvC3honcc3nrAYALGMELJrIi
 """
 
+import json
+import re
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+from openai import OpenAI
+
+DEBUG = True
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -162,6 +171,16 @@ class CaseState:
     conversation_turns: int = 0
 
     # =====================================================
+    # VALIDATION
+    # =====================================================
+
+    def __post_init__(self):
+        if self.max_attempts <= 0:
+            raise ValueError("max_attempts must be greater than 0")
+        if self.max_field_attempts <= 0:
+            raise ValueError("max_field_attempts must be greater than 0")
+
+    # =====================================================
     # SAFE ENTITY UPDATE
     # =====================================================
 
@@ -170,7 +189,8 @@ class CaseState:
         field_name,
         value,
         confidence=1.0,
-        source="system"
+        source="system",
+        max_length=500
     ):
 
         if value in [None, ""]:
@@ -178,7 +198,7 @@ class CaseState:
 
         value = str(value).strip()
 
-        if len(value) == 0:
+        if len(value) == 0 or len(value) > max_length:
             return False
 
         self.entities[field_name] = value
@@ -358,10 +378,6 @@ class InputAgent:
 
         return ""
 
-import json
-import re
-from openai import OpenAI
-
 
 class UnderstandingAgent:
 
@@ -378,7 +394,7 @@ class UnderstandingAgent:
         try:
             return json.loads(content)
 
-        except:
+        except (json.JSONDecodeError, ValueError, TypeError):
 
             match = re.search(
                 r"\{.*\}",
@@ -389,7 +405,7 @@ class UnderstandingAgent:
             if match:
                 try:
                     return json.loads(match.group())
-                except:
+                except (json.JSONDecodeError, ValueError, TypeError):
                     pass
 
         return {}
@@ -929,10 +945,6 @@ Input:
 
         return state
 
-import json
-import re
-from openai import OpenAI
-
 
 class CaseBuilderAgent:
 
@@ -954,7 +966,7 @@ class CaseBuilderAgent:
         try:
             return json.loads(content)
 
-        except:
+        except (json.JSONDecodeError, ValueError, TypeError):
 
             match = re.search(
                 r"\{.*\}",
@@ -965,7 +977,7 @@ class CaseBuilderAgent:
             if match:
                 try:
                     return json.loads(match.group())
-                except:
+                except (json.JSONDecodeError, ValueError, TypeError):
                     pass
 
         return {}
@@ -2040,10 +2052,6 @@ further assistance.
             "action": "handover"
         }
 
-import json
-import re
-from openai import OpenAI
-
 
 class VerificationAgent:
 
@@ -2370,10 +2378,6 @@ DEPARTMENTS = [
     }
 ]
 
-import json
-import re
-from openai import OpenAI
-
 
 class DecisionAgent:
 
@@ -2390,7 +2394,7 @@ class DecisionAgent:
         try:
             return json.loads(content)
 
-        except:
+        except (json.JSONDecodeError, ValueError, TypeError):
 
             match = re.search(
                 r"\{.*\}",
@@ -2401,7 +2405,7 @@ class DecisionAgent:
             if match:
                 try:
                     return json.loads(match.group())
-                except:
+                except (json.JSONDecodeError, ValueError, TypeError):
                     pass
 
         return {}
@@ -2809,6 +2813,19 @@ class Pipeline:
         departments
     ):
 
+        if not api_key or not isinstance(api_key, str):
+            raise ValueError("api_key must be a non-empty string")
+
+        if not departments or not isinstance(departments, list):
+            raise ValueError("departments must be a non-empty list")
+
+        for dept in departments:
+            if not isinstance(dept, dict):
+                raise ValueError("Each department must be a dictionary")
+            required_keys = {"name", "code", "required_fields"}
+            if not required_keys.issubset(dept.keys()):
+                raise ValueError(f"Department missing required keys: {required_keys}")
+
         self.input = InputAgent()
 
         self.u = UnderstandingAgent(api_key)
@@ -3012,9 +3029,6 @@ class Pipeline:
                     self.i.ask_rephrase(state)
                 )
 
-        # reset marker after stable turn
-        state.just_reset = False
-
         # =================================================
         # INITIAL CASE EXTRACTION
         # =================================================
@@ -3025,6 +3039,7 @@ class Pipeline:
         ):
 
             state.awaiting_new_issue = False
+            state.just_reset = False
 
             extracted = self.u.extract(
                 text,
@@ -3350,7 +3365,8 @@ class Pipeline:
             state,
             {
                 "text": (
-                    "Could you please clarify?"
+                    "I'm not sure what you mean. "
+                    "Could you please clarify your complaint or use 'restart' to begin a new case?"
                 ),
                 "action": "clarify"
             }
@@ -3377,18 +3393,10 @@ while True:
     # 🖨️ Bot response
     print("\nBot:", response.get("text"))
 
-    # 🧠 DEBUG (VERY IMPORTANT)
-    print("\n--- STATE ---")
-    print(state)
-
-    print("\n--- DEBUG SIGNALS ---")
-    print({
-        "attempts": state.attempts,
-        "correction_count": state.correction_count,
-        "last_corrected_field": state.last_corrected_field,
-        "awaiting_correction": state.awaiting_correction,
-        "just_reset": state.just_reset,
-        "sentiment": state.sentiment
-    })
-
-    print("\n" + "="*60 + "\n")
+    # 🧠 DEBUG OUTPUT (controlled by DEBUG flag)
+    if DEBUG:
+        logger.debug(f"STATE: {state}")
+        logger.debug(f"DEBUG_SIGNALS: {{'attempts': {state.attempts}, 'correction_count': {state.correction_count}, 'last_corrected_field': {state.last_corrected_field}, 'awaiting_correction': {state.awaiting_correction}, 'just_reset': {state.just_reset}, 'sentiment': {state.sentiment}}}")
+        print("\n" + "="*60 + "\n")
+    else:
+        print()  # Just add a newline for spacing
