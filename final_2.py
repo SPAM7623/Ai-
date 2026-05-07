@@ -45,7 +45,7 @@ class CaseState:
     # =====================================================
 
     sentiment: Optional[str] = None
-    confidence: float = 0.0
+    confidence: float = 0.85
     language: Optional[str] = None
 
     # =====================================================
@@ -420,9 +420,6 @@ class UnderstandingAgent:
         """Detect abuse/danger keywords and escalate sentiment"""
         text_lower = str(text or "").lower()
 
-        negation_words = ["not", "no", "don't", "didn't", "isn't", "aren't", "wasn't", "weren't"]
-        has_negation = any(f" {word} " in f" {text_lower} " for word in negation_words)
-
         critical_keywords = ["abuse", "assault", "violence", "weapon", "gun", "knife"]
         danger_keywords = [
             "threat", "threatened", "threatening", "threaten",
@@ -438,12 +435,13 @@ class UnderstandingAgent:
         def word_in_text(word):
             return re.search(r'\b' + re.escape(word) + r'\b', text_lower)
 
-        critical_count = sum(1 for kw in critical_keywords if word_in_text(kw))
-        danger_count = sum(1 for kw in danger_keywords if word_in_text(kw))
-        concern_count = sum(1 for kw in concern_keywords if word_in_text(kw))
+        def is_negated(word):
+            match = re.search(r'\b(not|no|don\'t|didn\'t|isn\'t|aren\'t|wasn\'t|weren\'t)\s+\w+\s+' + re.escape(word), text_lower)
+            return match is not None
 
-        if has_negation and (danger_count > 0 or concern_count >= 2):
-            return None
+        critical_count = sum(1 for kw in critical_keywords if word_in_text(kw) and not is_negated(kw))
+        danger_count = sum(1 for kw in danger_keywords if word_in_text(kw) and not is_negated(kw))
+        concern_count = sum(1 for kw in concern_keywords if word_in_text(kw) and not is_negated(kw))
 
         if critical_count >= 1 or danger_count >= 2:
             return "high"
@@ -1001,7 +999,8 @@ Input:
 
         risk_sentiment = self.detect_risk_indicators(state.last_user_message)
         if risk_sentiment:
-            state.sentiment = risk_sentiment
+            if state.sentiment != "high":
+                state.sentiment = risk_sentiment
 
         if result.get("confidence") is not None:
 
@@ -1070,16 +1069,19 @@ class CaseBuilderAgent:
     # =====================================================
 
     def format_extracted_value(self, value, field_name):
-        """Compact and clean extracted values"""
+        """Compact and clean extracted values - always returns a value"""
         if not value:
             return None
 
         value_str = str(value).strip()
 
+        if not value_str:
+            return None
+
         if "accused" in field_name.lower() or "suspect" in field_name.lower():
             if any(word in value_str.lower() for word in ["i don't know", "unknown", "no one", "nobody"]):
                 return "Unknown perpetrator"
-            return value_str[:100]
+            return value_str[:100] if len(value_str) > 100 else value_str
 
         if "date" in field_name.lower() or "time" in field_name.lower():
             return value_str.lower()
@@ -1095,7 +1097,7 @@ class CaseBuilderAgent:
                 return "no"
             return value_str
 
-        return value_str[:200]
+        return value_str[:200] if len(value_str) > 200 else value_str
 
     def check_fallback_acceptable(self, user_text, field_name):
         """Check if user explicitly said value is unknown/not applicable"""
@@ -2990,8 +2992,7 @@ class Pipeline:
     def apply_control(
         self,
         state,
-        text,
-        is_failed_attempt=False
+        text
     ):
 
         t = str(text or "").lower().strip()
@@ -3005,9 +3006,6 @@ class Pipeline:
                 "action": "handover",
                 "reason": "user_requested_human"
             }
-
-        if is_failed_attempt:
-            state.apply_attempt_decay()
 
         escalation_score = self._calculate_escalation_score(state)
 
