@@ -455,6 +455,65 @@ class UnderstandingAgent:
         return None
 
     # =====================================================
+    # FRUSTRATION & CONFUSION DETECTION
+    # =====================================================
+
+    def detect_frustration(self, text, state=None):
+        """Detect explicit frustration, confusion, and fatigue signals"""
+        text_lower = str(text or "").lower()
+
+        explicit_frustration = [
+            "frustrat", "annoyed", "annoying", "tired of",
+            "fed up", "enough", "stop", "quit", "give up",
+            "waste time", "waste my time", "pointless"
+        ]
+
+        confusion_phrases = [
+            "i can't understand", "i don't understand", "don't understand",
+            "confusing", "confused", "confuse me",
+            "unclear", "not clear", "what does",
+            "what do you mean", "what are you asking",
+            "too complicated", "too complex", "too many",
+            "complicated", "complex"
+        ]
+
+        incompleteness = [
+            "i don't know", "i don't know what",
+            "i don't know how", "i can't", "unable to",
+            "i can't provide", "i can't help"
+        ]
+
+        def find_phrase(phrases):
+            return any(re.search(r'\b' + re.escape(phrase) + r'\b', text_lower) for phrase in phrases)
+
+        frustration_count = sum(1 for phrase in explicit_frustration if find_phrase([phrase]))
+        confusion_count = sum(1 for phrase in confusion_phrases if find_phrase([phrase]))
+        incompleteness_count = sum(1 for phrase in incompleteness if find_phrase([phrase]))
+
+        if frustration_count >= 1:
+            return "high"
+
+        if confusion_count >= 2 or incompleteness_count >= 2:
+            return "medium_high"
+
+        if confusion_count >= 1 or incompleteness_count >= 1:
+            return "medium_high"
+
+        return None
+
+    # =====================================================
+    # REPETITION DETECTION
+    # =====================================================
+
+    def detect_repetition_fatigue(self, state):
+        """Detect if same field has been asked multiple times"""
+        if not state.current_field or not state.field_attempts:
+            return False
+
+        field_attempt_count = state.field_attempts.get(state.current_field, 0)
+        return field_attempt_count >= 3
+
+    # =====================================================
     # NORMALIZATION
     # =====================================================
 
@@ -1001,6 +1060,11 @@ Input:
         if risk_sentiment:
             if state.sentiment != "high":
                 state.sentiment = risk_sentiment
+
+        frustration_sentiment = self.detect_frustration(state.last_user_message, state)
+        if frustration_sentiment:
+            if state.sentiment != "high":
+                state.sentiment = frustration_sentiment
 
         if result.get("confidence") is not None:
 
@@ -3006,6 +3070,9 @@ class Pipeline:
                 "action": "handover",
                 "reason": "user_requested_human"
             }
+
+        if self.u.detect_repetition_fatigue(state):
+            state.sentiment = "high"
 
         escalation_score = self._calculate_escalation_score(state)
 
