@@ -144,6 +144,14 @@ class CaseState:
     department_field_count: int = 0
 
     # =====================================================
+    # REVERIFICATION STATE (after soft reset)
+    # =====================================================
+
+    awaiting_reverify_confirmation: bool = False
+    reverify_attempts: int = 0
+    max_reverify_attempts: int = 2
+
+    # =====================================================
     # GLOBAL FLOW CONTROL
     # =====================================================
 
@@ -318,6 +326,7 @@ class CaseState:
 
         self.awaiting_correction = False
         self.awaiting_new_issue = False
+        self.awaiting_reverify_confirmation = False
 
         self.current_field = None
         self.last_asked_field = None
@@ -331,6 +340,7 @@ class CaseState:
         self.field_attempts = {}
         self.correction_passes = 0
         self.fields_corrected_in_pass = []
+        self.reverify_attempts = 0
 
     # =====================================================
     # CORRECTION TRACKING
@@ -409,7 +419,7 @@ class CaseState:
             if not value:
                 continue
 
-            confidence = self.entity_confidence.get(field_name, 0.0)
+            confidence = self.entity_confidence.get(field_name, 0.85)
 
             if confidence < threshold:
                 low_conf_fields.append((field_name, confidence, value))
@@ -1742,7 +1752,7 @@ OR
                         value=formatted_value,
                         confidence=extracted.get(
                             "confidence",
-                            0.8
+                            0.85
                         ),
                         source="global_extraction"
                     )
@@ -1776,6 +1786,27 @@ OR
                         )
 
             state.reduce_confidence(0.05)
+
+        # =================================================
+        # REVERIFY UPDATE (after soft reset)
+        # Does NOT inflate correction metrics
+        # =================================================
+
+        elif mode == "reverify":
+
+            for field, value in extracted.items():
+
+                if field.startswith("__"):
+                    continue
+
+                formatted_value = self.format_extracted_value(value, field)
+                if formatted_value:
+                    state.update_entity(
+                        field_name=field,
+                        value=formatted_value,
+                        confidence=0.95,
+                        source="reverify"
+                    )
 
         # =================================================
         # NORMAL UPDATE
@@ -2123,14 +2154,16 @@ Ask the user to provide:
     # RE-VERIFY LOW CONFIDENCE FIELDS (after soft reset)
     # =====================================================
 
-    def ask_reverify_low_confidence(self, state):
+    def ask_reverify_low_confidence(self, state, confidence_threshold=0.80):
 
-        low_conf_fields = state.get_low_confidence_fields(threshold=0.80)
+        low_conf_fields = state.get_low_confidence_fields(threshold=confidence_threshold)
 
         if not low_conf_fields:
             return None
 
         state.last_action = "reverify_low_confidence"
+        state.awaiting_reverify_confirmation = True
+        state.reverify_attempts = 0
 
         field_name, confidence, value = low_conf_fields[0]
 
@@ -2153,6 +2186,31 @@ Is that correct?
                 instruction
             ),
             "action": "reverify_field",
+            "field": field_name
+        }
+
+    # =====================================================
+    # ASK FOR CORRECTED VALUE DURING REVERIFY
+    # =====================================================
+
+    def ask_reverify_correction(self, state):
+
+        field_name = state.current_field
+        nice_field = self.humanize(field_name)
+
+        instruction = f"""
+What is the correct value for {nice_field}?
+"""
+
+        state.last_action = "reverify_correction"
+        state.reverify_attempts += 1
+
+        return {
+            "text": self.gen(
+                state,
+                instruction
+            ),
+            "action": "reverify_correction",
             "field": field_name
         }
 
@@ -3466,15 +3524,22 @@ class Pipeline:
 
             target_field = state.current_field
 
-            if self.d.is_pure_yes(self.d.normalize(text)):
+            # Check for escalation signals during reverification
+            control = self.apply_control(state, text)
+            if control:
+                return (state, control)
 
-                # User confirmed the value, increase confidence
+            t_norm = self.d.normalize(text)
+
+            # CASE 1: User confirms the value
+            if self.d.is_pure_yes(t_norm):
                 state.entity_confidence[target_field] = 0.95
+                state.awaiting_reverify_confirmation = False
+                state.reverify_attempts = 0
                 state.last_action = None
 
-            elif self.d.detect_explicit_correction(text):
-
-                # User is correcting the value
+            # CASE 2: User provides explicit correction
+            elif self.d.detect_explicit_correction(t_norm):
                 extracted = self.u.extract(
                     text,
                     mode="field",
@@ -3483,14 +3548,38 @@ class Pipeline:
                 )
 
                 if extracted:
-                    state = self.c.update_case(
+                    # Use reverify mode to avoid correction inflation
+                    self.c.update_case(
                         state,
                         extracted,
-                        mode="correction"
+                        mode="reverify"
+                    )
+                    state.entity_confidence[target_field] = 0.95
+                    state.awaiting_reverify_confirmation = False
+                    state.reverify_attempts = 0
+                    state.last_action = None
+                else:
+                    # Extraction failed, ask again
+                    return (
+                        state,
+                        self.i.ask_reverify_correction(state)
                     )
 
-                    state.entity_confidence[target_field] = 0.95
-                    state.last_action = None
+            # CASE 3: User rejects but doesn't provide correction yet
+            elif self.d.is_pure_rejection(t_norm):
+                # Ask user to provide the correct value
+                return (
+                    state,
+                    self.i.ask_reverify_correction(state)
+                )
+
+            # CASE 4: Vague/uncertain response
+            else:
+                # Treat as rejection and ask for correction
+                return (
+                    state,
+                    self.i.ask_reverify_correction(state)
+                )
 
             # Check for more low-confidence fields
             reverify_response = self.i.ask_reverify_low_confidence(state)
@@ -3512,6 +3601,69 @@ class Pipeline:
             return (
                 state,
                 self.build_verification_response(state)
+            )
+
+        # =================================================
+        # REVERIFY CORRECTION RESPONSE
+        # =================================================
+
+        if state.last_action == "reverify_correction":
+
+            target_field = state.current_field
+
+            # Check for escalation signals
+            control = self.apply_control(state, text)
+            if control:
+                return (state, control)
+
+            # Check attempt limit
+            if state.reverify_attempts >= state.max_reverify_attempts:
+                state.sentiment = "high"
+                return (state, self.i.ask_rephrase(state))
+
+            extracted = self.u.extract(
+                text,
+                mode="field",
+                target_field=target_field,
+                state=state
+            )
+
+            # Valid correction provided
+            if extracted:
+                self.c.update_case(
+                    state,
+                    extracted,
+                    mode="reverify"
+                )
+                state.entity_confidence[target_field] = 0.95
+                state.awaiting_reverify_confirmation = False
+                state.reverify_attempts = 0
+                state.last_action = None
+
+                # Check for more low-confidence fields
+                reverify_response = self.i.ask_reverify_low_confidence(state)
+
+                if reverify_response:
+                    return (state, reverify_response)
+
+                # No more low-confidence fields
+                state.just_reset = False
+
+                if state.missing_fields:
+                    return (
+                        state,
+                        self.i.ask_missing(state)
+                    )
+
+                return (
+                    state,
+                    self.build_verification_response(state)
+                )
+
+            # Invalid correction, ask again
+            return (
+                state,
+                self.i.ask_reverify_correction(state)
             )
 
         # =================================================
